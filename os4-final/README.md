@@ -1,416 +1,309 @@
-# OrderStream — Real-Time Order Tracking
-
-A full-stack event-driven system where every change to an order is instantly
-broadcast to **all connected portals** without polling or page refreshes.
-Open three browser tabs on different ports — create an order on one and watch
-it appear on the others in under a second.
-
+Real-Time Order Tracking Platform
+A scalable, event-driven order tracking system built with FastAPI, PostgreSQL, Redis Pub/Sub, WebSockets, Docker, and React. The system listens for database changes and instantly pushes updates to all connected clients — no polling, no page refreshes.
+Open three browser tabs on different ports. Create an order on one. Watch it appear on all others in under a second.
 ---
-
-## Architecture
-
-```
-Browser Tab          Browser Tab          Browser Tab
-(localhost:4000)     (localhost:4001)     (localhost:4002)
-      |                    |                    |
-   nginx               nginx               nginx
-      |                    |                    |
-      +--------------------+--------------------+
-                           |
-                    FastAPI Backend
-                    (single process)
-                           |
-              +------------+------------+
-              |                         |
-        asyncpg pool             ConnectionManager
-        (REST API)               (WebSocket registry)
-              |                         ^
-              |                         |
-        PostgreSQL               Redis Broadcaster
-        orders table             (subscribes to Redis)
-              |                         |
-        DB Trigger               Redis Pub/Sub
-        (NOTIFY on every         (order_updates channel)
-         INSERT/UPDATE/DELETE)         |
-              |                         |
-              +-------- DB Listener ----+
-                        (asyncpg LISTEN)
-```
-
-### Event flow — step by step
-
-1. User creates / updates / deletes an order via the REST API
-2. PostgreSQL trigger fires `NOTIFY order_updates` with a JSON payload
-3. DB Listener (asyncpg) receives the notification and publishes it to Redis
-4. Redis Broadcaster (separate connection) receives from Pub/Sub
-5. `ConnectionManager.broadcast()` fans the message out to **every** connected
-   WebSocket client across all portals simultaneously
-6. Each browser tab receives the event and patches its local state — no refresh
-
+Features
+Real-time order updates across all connected clients simultaneously
+PostgreSQL `LISTEN`/`NOTIFY` triggers — the DB itself fires the event
+Redis Pub/Sub messaging layer for horizontal scalability
+WebSocket broadcasting to every browser tab at once
+Event replay on reconnect (last 50 events sent on connect)
+JWT authentication on both REST and WebSocket endpoints
+Live dashboard: order grid, event log sidebar, connected-client counter
+Fully Dockerized — one command to start everything
 ---
-
-## Tech Stack
-
-| Layer      | Technology                        |
-|------------|-----------------------------------|
-| Frontend   | React 18, Vite, nginx             |
-| Backend    | Python 3.11, FastAPI, uvicorn     |
-| Database   | PostgreSQL 16                     |
-| Pub/Sub    | Redis 7                           |
-| Auth       | JWT (python-jose)                 |
-| Container  | Docker, Docker Compose            |
-
----
-
-## Folder Structure
-
+Architecture
+How a database change reaches the browser
 ```
-os4-final/
-├── docker-compose.yml          # Spins up all services + 3 portals
-│
-├── sql/
-│   ├── schema.sql              # orders + order_events tables
-│   ├── triggers.sql            # notify_order_change() trigger
-│   └── seed.sql                # Optional sample data
-│
-├── backend/
-│   ├── main.py                 # FastAPI app, lifespan, WebSocket endpoint
-│   ├── config.py               # All env vars in one place
-│   ├── database.py             # asyncpg pool, schema init, event fetch
-│   ├── models.py               # Pydantic request/response models
-│   ├── auth.py                 # JWT create / verify
-│   ├── routes_orders.py        # REST CRUD endpoints
-│   ├── websocket_manager.py    # ConnectionManager — tracks all WS clients
-│   ├── db_listener.py          # asyncpg LISTEN → Redis PUBLISH
-│   ├── redis_broadcaster.py    # Redis SUBSCRIBE → WebSocket broadcast
-│   ├── redis_pubsub.py         # Thin Redis client helpers
-│   ├── requirements.txt
-│   └── Dockerfile
-│
-└── frontend/
-    ├── src/
-    │   ├── components/
-    │   │   ├── Dashboard.jsx       # Main view — orders grid + event log
-    │   │   ├── OrderCard.jsx       # Individual order card with actions
-    │   │   ├── CreateOrderModal.jsx
-    │   │   ├── EventLog.jsx        # Real-time sidebar event feed
-    │   │   ├── MetricsBar.jsx      # Live connected clients + uptime
-    │   │   ├── ConnectionBadge.jsx # WebSocket status indicator
-    │   │   └── LoginPage.jsx
-    │   ├── hooks/
-    │   │   ├── useWebSocket.js     # WS connect / reconnect / broadcast
-    │   │   └── AuthContext.jsx     # JWT storage + login/logout
-    │   └── utils/
-    │       └── api.js              # All fetch() calls to the REST API
-    ├── nginx.conf                  # Proxies /api/* and /ws to backend
-    ├── vite.config.js
-    ├── package.json
-    └── Dockerfile
+Database Change (INSERT / UPDATE / DELETE)
+           ↓
+  PostgreSQL Trigger
+  notify\_order\_change()
+  pg\_notify('order\_updates', payload)
+           ↓
+  DB Listener Service
+  (asyncpg LISTEN — db\_listener.py)
+           ↓
+  Redis Pub/Sub
+  channel: "order\_updates"
+           ↓
+  Redis Broadcaster
+  (redis\_broadcaster.py)
+           ↓
+  WebSocket Manager
+  ConnectionManager.broadcast()
+           ↓
+  React Frontend Updates Instantly
+  (all tabs, all portals, simultaneously)
 ```
-
+Full system diagram
+```
+Browser :4000    Browser :4001    Browser :4002
+    │                 │                 │
+    └─────────────────┼─────────────────┘
+                      │  WebSocket connections
+                ┌─────▼──────┐
+                │  FastAPI   │
+                │  Backend   │
+                └─────┬──────┘
+                      │
+         ┌────────────┴────────────┐
+         │                         │
+  ┌──────▼──────┐        ┌─────────▼────────┐
+  │  asyncpg    │        │ ConnectionManager │
+  │  REST pool  │        │ (WebSocket reg.)  │
+  └──────┬──────┘        └─────────▲────────┘
+         │                         │
+  ┌──────▼──────┐        ┌─────────┴────────┐
+  │ PostgreSQL  │        │ Redis Broadcaster │
+  │ orders      │        │ (SUBSCRIBE)       │
+  │             │        └─────────▲────────┘
+  │ Trigger →   │                  │
+  │ NOTIFY      │        ┌─────────┴────────┐
+  └──────┬──────┘        │  Redis Pub/Sub   │
+         │               │  "order\_updates" │
+         └───DB Listener─┘
+              (LISTEN)
+```
 ---
-
-## Setup & Running
-
-### Prerequisites
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
-- Ports `4000`, `4001`, `4002` free on your machine
-
-### 1 — Clone / unzip the project
-
+Tech Stack
+Backend
+Python 3.11, FastAPI, uvicorn (async-first ASGI stack)
+PostgreSQL 16 with `LISTEN`/`NOTIFY` and PL/pgSQL triggers
+Redis 7 Pub/Sub (message bus between DB listener and WebSocket broadcaster)
+asyncpg (native async PostgreSQL driver with LISTEN support)
+JWT authentication (python-jose, HS256)
+Frontend
+React 18, Vite
+TailwindCSS
+nginx (serves React build and proxies `/api/\*` and `/ws` to backend)
+DevOps
+Docker, Docker Compose
+Three frontend replicas on ports 4000, 4001, 4002 sharing one backend
+---
+Why I Chose This Architecture
+Event-driven over polling
+I used an event-driven architecture instead of polling to achieve low-latency real-time updates efficiently.
+With polling, every client repeatedly asks "did anything change?" — cost scales as O(clients × poll_frequency). With 1,000 clients polling every 5 seconds, that is 200 database requests per second at idle, even when nothing has changed. With this event-driven design, the cost is O(1) per actual change — one trigger, one Redis publish, one fan-out — regardless of how many clients are connected.
+Why PostgreSQL `LISTEN`/`NOTIFY` over application-level events?
+The database is the authoritative source of truth. If you fire events at the application layer — "publish to Redis after my INSERT succeeds" — you risk a silent failure: a crash between the INSERT and the publish leaves clients permanently out of sync. Using a database trigger guarantees that every committed write fires exactly one notification, regardless of which code path or backend instance caused it. There is no way to insert, update, or delete an order without the trigger firing. Even direct `psql` edits by a DBA propagate automatically.
+Why Redis Pub/Sub as the middle layer?
+Decoupling and horizontal scalability. A single FastAPI process could receive the PostgreSQL NOTIFY and directly broadcast to its own WebSocket clients — but with multiple backend replicas behind a load balancer, each replica only sees its own connected clients. Redis Pub/Sub solves this: every backend subscribes to the same channel. When any backend publishes an event, all replicas receive it and broadcast to their own client pools. Scaling from one backend to ten requires no code changes.
+Redis also decouples the `db\_listener` from the `redis\_broadcaster` — each has independent reconnect logic and can restart without affecting the other.
+Why WebSockets over Server-Sent Events or long polling?
+Mechanism	Latency	Overhead	Bi-directional	Notes
+WebSockets	~0ms	Very low	Yes	Used here
+SSE	~0ms	Low	No	Would also work
+Long Polling	High	High (new conn each time)	No	Wasteful
+WebSockets were chosen over SSE because they allow future bi-directional use (e.g., the client sending actions without a separate REST call), and FastAPI's WebSocket support is first-class. JWT auth passes cleanly as a `?token=` query parameter on the upgrade request — a standard, well-understood pattern.
+Why asyncpg specifically?
+`asyncpg` is the only Python PostgreSQL driver with native async support for `LISTEN`/`NOTIFY`. When PostgreSQL fires `pg\_notify`, asyncpg dispatches the callback directly on the asyncio event loop — zero polling latency, no sleep loops, no thread overhead. The event arrives within milliseconds of the commit.
+---
+How to Run
+Prerequisites
+Docker Desktop installed and running
+Ports `4000`, `4001`, `4002` free on your machine
+1 — Unzip the project
 ```bash
-# If you have the zip
 unzip os4-final.zip
 cd os4-final
 ```
-
-### 2 — Start everything
-
+2 — Start everything
 ```bash
 docker compose up --build
 ```
-
-### 3 — Wait for these lines in the terminal
-
+This builds and starts six containers: PostgreSQL, Redis, the FastAPI backend, and three nginx/React frontends.
+3 — Wait for these log lines
 ```
 redis-1     | Ready to accept connections
 backend-1   | Schema and triggers applied.
 backend-1   | Application startup complete.
 frontend-1  | start worker process
 ```
-
-### 4 — Open the portals
-
-| Portal   | URL                      | Login               |
-|----------|--------------------------|---------------------|
-| Portal 1 | http://localhost:4000    | admin / admin123    |
-| Portal 2 | http://localhost:4001    | viewer / viewer123  |
-| Portal 3 | http://localhost:4002    | admin / admin123    |
-
-### 5 — Verify real-time sync
-
-1. Open all three URLs in separate browser tabs
-2. Create an order on `:4000`
-3. It appears instantly on `:4001` and `:4002` — no refresh needed
-4. Change a status on `:4001` — both other tabs update immediately
-5. The **event log sidebar** on the right shows every change live
-
+The backend automatically runs `schema.sql` and `triggers.sql` on first boot.
+4 — Open the portals
+Portal	URL	Login
+Portal 1	http://localhost:4000	`admin` / `admin123`
+Portal 2	http://localhost:4001	`admub` / `admin123`
+Portal 3	http://localhost:4002	`admin` / `admin123`
+All three portals connect to the same backend — every client on every port receives every broadcast.
+Interactive API docs: http://localhost:4000/api/docs
 ---
-
-## Docker Commands
-
+Verifying Real-Time Updates
+Browser test
+Open all three URLs in separate browser tabs and log in
+On Portal 1: click "New Order" and create an order
+Watch it appear instantly on Portal 2 and Portal 3 — no refresh
+Change a status on Portal 2 — both other tabs update immediately
+Check the Event Log sidebar on the right — every change streams in live
+The MetricsBar at the top shows the live connected client count
+CLI test (no browser needed)
+Get a token:
 ```bash
-# Start all services (first run — builds images)
+curl -s -X POST http://localhost:4000/api/auth/login \\
+  -H "Content-Type: application/json" \\
+  -d '{"username":"admin","password":"admin123"}' | python3 -m json.tool
+```
+Open a WebSocket listener (install `wscat` with `npm install -g wscat`):
+```bash
+wscat -c "ws://localhost:4000/ws?token=<YOUR\_TOKEN>"
+```
+You immediately receive a connection confirmation and a replay of recent events.
+Trigger an event from a second terminal:
+```bash
+TOKEN="<paste your token>"
+
+curl -s -X POST http://localhost:4000/api/orders \\
+  -H "Authorization: Bearer $TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{"customer\_name":"CLI Test","product\_name":"Keyboard","status":"pending"}' \\
+  | python3 -m json.tool
+```
+The WebSocket terminal prints the broadcast instantly:
+```json
+{
+  "operation": "INSERT",
+  "table": "orders",
+  "data": {
+    "id": 1,
+    "customer\_name": "CLI Test",
+    "product\_name": "Keyboard",
+    "status": "pending",
+    "updated\_at": "2024-01-15 10:30:00"
+  },
+  "timestamp": 1705312200.123
+}
+```
+Health and metrics
+```bash
+# Health check (no auth needed)
+curl http://localhost:4000/api/health
+
+# Live metrics: connected clients, events fired, uptime
+curl -H "Authorization: Bearer $TOKEN" http://localhost:4000/api/metrics
+```
+---
+API Reference
+Base URL: `http://localhost:4000/api`
+Auth
+Method	Endpoint	Description	Auth
+POST	`/auth/login`	Returns JWT token	No
+Orders
+All endpoints require `Authorization: Bearer <token>`.
+Method	Endpoint	Description	Status
+GET	`/orders`	List all orders	200
+POST	`/orders`	Create an order	201
+PUT	`/orders/{id}`	Update an order	200
+DELETE	`/orders/{id}`	Delete an order	204
+Create order body:
+```json
+{
+  "customer\_name": "Alice Johnson",
+  "product\_name": "Wireless Headphones",
+  "status": "pending"
+}
+```
+Valid statuses: `pending` → `shipped` → `delivered`
+System
+Method	Endpoint	Description	Auth
+GET	`/health`	DB + Redis health check	No
+GET	`/metrics`	Clients, events fired, uptime	Yes
+---
+WebSocket Protocol
+Connect: `ws://localhost:<PORT>/ws?token=<JWT>`
+Message types received from server:
+Type	When	Description
+`connection`	On connect	Confirms auth, sends `client\_id`
+`replay`	On connect	Last 50 events for catch-up
+(no type field)	On any DB change	Live broadcast: `{ operation, table, data, timestamp }`
+`operation` is one of `INSERT`, `UPDATE`, `DELETE`.
+---
+Project Structure
+```
+os4-final/
+├── docker-compose.yml          # All services + 3 portal replicas
+├── sql/
+│   ├── schema.sql              # orders + order\_events tables
+│   ├── triggers.sql            # notify\_order\_change() PL/pgSQL trigger
+│   └── seed.sql                # Sample data (optional)
+├── backend/
+│   ├── main.py                 # FastAPI app, lifespan, /ws endpoint
+│   ├── db\_listener.py          # Background task: PostgreSQL → Redis
+│   ├── redis\_broadcaster.py    # Background task: Redis → WebSockets
+│   ├── websocket\_manager.py    # ConnectionManager (registry + broadcast)
+│   ├── redis\_pubsub.py         # Redis publish/subscribe helpers
+│   ├── routes\_orders.py        # REST CRUD endpoints
+│   ├── database.py             # asyncpg pool + schema init
+│   ├── auth.py                 # JWT create/verify
+│   ├── config.py               # All env vars (Settings)
+│   ├── models.py               # Pydantic models
+│   └── Dockerfile
+└── frontend/
+    ├── src/
+    │   ├── components/         # Dashboard, OrderCard, EventLog, MetricsBar, ...
+    │   ├── hooks/              # useWebSocket.js, AuthContext.jsx
+    │   └── utils/api.js        # REST API wrapper
+    ├── nginx.conf              # Proxies /api/\* and /ws to backend
+    └── Dockerfile
+```
+---
+Environment Variables
+Variable	Default	Description
+`DATABASE\_URL`	`postgresql://postgres:password@db:5432/orders\_db`	asyncpg connection string
+`REDIS\_URL`	`redis://redis:6379`	Redis connection string
+`JWT\_SECRET`	`orderstream-secret-key-2024`	Change in production
+`JWT\_EXPIRY\_MINUTES`	`60`	Token lifetime (minutes)
+`CORS\_ORIGINS`	`http://localhost:4000,...`	Comma-separated allowed origins
+`APP\_ENV`	`production`	`development` or `production`
+---
+Docker Commands
+```bash
+# Start (first run — builds images)
 docker compose up --build
 
 # Start in background
 docker compose up --build -d
 
-# View live logs
+# View all logs live
 docker compose logs -f
 
-# View backend logs only
+# Backend logs only
 docker compose logs backend -f
 
-# Stop everything (keeps database data)
+# Stop (keeps database data)
 docker compose down
 
-# Stop and wipe the database (full reset)
+# Full reset (wipes database)
 docker compose down -v
 
 # Rebuild after code changes
-docker compose down -v
-docker rmi os4-final-frontend os4-final-frontend2 os4-final-frontend3 os4-final-backend --force
-docker compose up --build
+docker compose down -v \&\& docker compose up --build
 
-# Open a shell inside the backend container
+# Shell inside backend
 docker compose exec backend bash
 
-# Connect to PostgreSQL directly
-docker compose exec db psql -U postgres -d orders_db
+# PostgreSQL shell
+docker compose exec db psql -U postgres -d orders\_db
 ```
-
 ---
-
-## API Endpoints
-
-Base URL: `http://localhost:4000/api`
-
-Interactive docs: `http://localhost:4000/api/docs`
-
-### Auth
-
-| Method | Endpoint         | Description              | Auth required |
-|--------|------------------|--------------------------|---------------|
-| POST   | `/auth/login`    | Get a JWT token          | No            |
-
-**Request body:**
-```json
-{ "username": "admin", "password": "admin123" }
-```
-
-**Response:**
-```json
-{ "access_token": "eyJhbGci..." }
-```
-
-### Orders
-
-All order endpoints require `Authorization: Bearer <token>` header.
-
-| Method | Endpoint           | Description         | Status code |
-|--------|--------------------|---------------------|-------------|
-| GET    | `/orders`          | List all orders     | 200         |
-| POST   | `/orders`          | Create an order     | 201         |
-| PUT    | `/orders/{id}`     | Update an order     | 200         |
-| DELETE | `/orders/{id}`     | Delete an order     | 204         |
-
-**Create order — request body:**
-```json
-{
-  "customer_name": "Alice Johnson",
-  "product_name":  "Wireless Headphones",
-  "status":        "pending"
-}
-```
-
-**Order response:**
-```json
-{
-  "id":            1,
-  "customer_name": "Alice Johnson",
-  "product_name":  "Wireless Headphones",
-  "status":        "pending",
-  "updated_at":    "2024-01-15 10:30:00"
-}
-```
-
-**Update order — request body (all fields optional):**
-```json
-{ "status": "shipped" }
-```
-
-**Status values:** `pending` → `shipped` → `delivered`
-
-### System
-
-| Method | Endpoint    | Description                        | Auth required |
-|--------|-------------|------------------------------------|---------------|
-| GET    | `/health`   | Database + Redis health check      | No            |
-| GET    | `/metrics`  | Connected clients, uptime, events  | Yes           |
-
-**Metrics response:**
-```json
-{
-  "connected_clients":  3,
-  "total_events_fired": 42,
-  "uptime_seconds":     3600.5
-}
-```
-
----
-
-## WebSocket Usage
-
-### Connect
-
-```
-ws://localhost:4000/ws?token=<JWT>
-ws://localhost:4001/ws?token=<JWT>
-ws://localhost:4002/ws?token=<JWT>
-```
-
-All three connect to the **same backend** — so all clients on all ports
-receive every broadcast.
-
-### Message types
-
-**On connect — server sends a confirmation:**
-```json
-{
-  "type":      "connection",
-  "message":   "Connected to real-time order updates.",
-  "client_id": "7e21124a-..."
-}
-```
-
-**On connect — server replays the last 50 events:**
-```json
-{
-  "type":   "replay",
-  "events": [ ... ],
-  "count":  12
-}
-```
-
-**On any order change — server broadcasts to all clients:**
-```json
-{
-  "operation": "INSERT",
-  "table":     "orders",
-  "data": {
-    "id":            3,
-    "customer_name": "Bob Smith",
-    "product_name":  "Laptop Stand",
-    "status":        "pending",
-    "updated_at":    "2024-01-15 10:30:00"
-  },
-  "timestamp": 1705312200.123
-}
-```
-
-`operation` is one of: `INSERT`, `UPDATE`, `DELETE`
-
-### JavaScript example
-
-```javascript
-const token = 'eyJhbGci...'
-const ws = new WebSocket(`ws://localhost:4000/ws?token=${token}`)
-
-ws.onopen = () => console.log('Connected')
-
-ws.onmessage = (evt) => {
-  const msg = JSON.parse(evt.data)
-
-  if (msg.type === 'connection') return
-  if (msg.type === 'replay') {
-    console.log(`Caught up with ${msg.count} past events`)
-    return
-  }
-
-  const { operation, data } = msg
-  console.log(`${operation} — order #${data.id} (${data.status})`)
-}
-
-ws.onclose = () => console.log('Disconnected')
-```
-
----
-
-## Scalability
-
-### How it scales horizontally
-
-The architecture uses **Redis Pub/Sub as the message bus** between backend
-instances. This means you can run multiple backend replicas behind a load
-balancer and all connected clients still receive every event:
-
+Scalability
+The Redis Pub/Sub layer means you can run multiple backend replicas without any code changes:
 ```
 Load Balancer
-    |
-    +--------+--------+
-    |                 |
-Backend 1         Backend 2
-(clients A, B)    (clients C, D)
-    |                 |
-    +----> Redis <----+
-           (shared Pub/Sub channel)
+      │
+   ┌──┴──┬──────┐
+   │     │      │
+Back1  Back2  Back3      ← each has its own WebSocket clients
+   │     │      │
+   └──┬──┴──────┘
+      │
+    Redis            ← single shared channel; all backends subscribe
+      │
+  PostgreSQL         ← one primary; trigger fires once per commit
 ```
-
-When an order changes, the DB trigger fires once. Redis fans it out to every
-backend instance. Each instance broadcasts to its own pool of WebSocket
-clients. All clients on all instances receive the event.
-
-### Scaling checklist
-
-| Concern              | Solution                                              |
-|----------------------|-------------------------------------------------------|
-| More portals         | Add `frontendN` services in `docker-compose.yml`      |
-| More backend workers | Add replicas behind nginx upstream load balancing     |
-| Database load        | Add read replicas; write path stays on primary        |
-| Redis reliability    | Switch to Redis Sentinel or Redis Cluster             |
-| Auth in production   | Replace demo passwords with a real user store + bcrypt|
-| HTTPS / WSS          | Add SSL termination at the nginx or load balancer layer|
-
-### Why not polling?
-
-Polling (fetching `/orders` every N seconds) wastes bandwidth, adds latency,
-and hammers the database proportionally to the number of clients. With this
-architecture, a single DB write triggers exactly one `NOTIFY`, one Redis
-publish, and one fan-out — regardless of how many clients are connected.
-Cost is O(1) per event, not O(clients × poll_interval).
-
+One DB commit → one NOTIFY → one Redis publish → all backends fan out to all their clients. Cost is O(1) per event, not O(clients).
 ---
-
-## Demo Credentials
-
-| Username | Password   | Role   | Can create/edit/delete |
-|----------|------------|--------|------------------------|
-| admin    | admin123   | admin  | Yes                    |
-| viewer   | viewer123  | viewer | Yes (demo mode)        |
-
----
-
-## Environment Variables
-
-Configured in `docker-compose.yml` under the `backend` service:
-
-| Variable             | Default                                        | Description                  |
-|----------------------|------------------------------------------------|------------------------------|
-| `DATABASE_URL`       | `postgresql://postgres:password@db:5432/...`   | PostgreSQL connection string  |
-| `REDIS_URL`          | `redis://redis:6379`                           | Redis connection string       |
-| `JWT_SECRET`         | `orderstream-secret-key-2024`                  | Change this in production     |
-| `JWT_EXPIRY_MINUTES` | `60`                                           | Token lifetime in minutes     |
-| `CORS_ORIGINS`       | `http://localhost:4000,...`                    | Comma-separated allowed origins|
-| `APP_ENV`            | `production`                                   | `development` or `production` |
+Demo Credentials
+Username	Password	Role
+`admin`	`admin123`	admin
+`viewer`	`viewer123`	viewer
